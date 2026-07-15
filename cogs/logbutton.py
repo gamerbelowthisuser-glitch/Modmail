@@ -1,81 +1,93 @@
 """
-Modmail plugin: adds a button inside each thread channel that lets staff
-pull up ONLY the actual conversation (user + staff messages), stripped of
-system messages, internal notes, and embed clutter.
+Modmail addon: replaces the "Log link" URL button on the thread-closed
+embed (sent to the log channel) with an interactive "Request Message Log"
+button. Clicking it shows just the plain conversation (no system messages,
+no internal notes) directly in Discord, instead of linking out to the
+external logviewer.
 
 INSTALL
 -------
-Drop this file into your bot's `cogs/` folder (or wherever you keep custom
-plugins/cogs for this fork), then load it like any other cog, e.g.:
+1. Place this file at:  cogs/logbutton.py
+2. Edit bot.py and add "cogs.logbutton" to self.loaded_cogs:
 
-    bot.load_extension("cogs.logbutton")
+    self.loaded_cogs = [
+        "cogs.modmail",
+        "cogs.plugins",
+        "cogs.utility",
+        "cogs.threadmenu",
+        "cogs.logbutton",
+    ]
 
-or if this fork uses the plugin manager, package it as a plugin with an
-info.json and load via `?plugins add <path>`.
+3. Apply the accompanying change to core/thread.py's `_close` method (the
+   block that currently builds the "Log link" URL button needs to be
+   swapped for a button with a matching custom_id — see the diff provided
+   alongside this file).
+4. Restart the bot.
 
-NOTES / THINGS TO DOUBLE-CHECK FOR YOUR FORK
----------------------------------------------
-This fork (gamerbelowthisuser-glitch/Modmail) has custom additions on top of
-upstream modmail-dev/Modmail (e.g. thread_creation_menu), so a couple of
-names below may need small adjustments to match your codebase exactly:
+WHY DynamicItem
+---------------
+The view carrying this button is built once inside Thread._close() and
+never kept around afterward — there's no persistent object to re-register
+each button against on restart. `discord.ui.DynamicItem` solves this: it
+matches on a regex pattern against the button's `custom_id` whenever ANY
+interaction comes in, and reconstructs itself on the fly. That means the
+button keeps working correctly forever, across restarts, without
+core/thread.py needing to import this cog or know anything about it — it
+only needs to set a custom_id like "logrequest:<channel_id>" on the button
+it sends.
 
-1. `self.bot.threads.find(channel=...)` — this is the standard modmail-dev
-   API for resolving a Thread object from a channel. If your fork renamed
-   `bot.threads` or `Thread`, adjust accordingly.
-2. `self.bot.api.get_log(channel.id)` — standard modmail-dev log API call
-   that returns the raw log document (dict) for a thread, including a
-   `messages` list. Each message dict has `type`, `content`, and `author`.
-   If your log schema stores things differently, adjust the `entry.get(...)`
-   calls in `request_log` to match your document shape.
-3. `on_thread_ready` — the event fired once a modmail thread channel is
-   fully created. If your fork uses a different event name (check bot.py /
-   core/thread.py for `self.bot.dispatch(...)` calls), update the listener
-   name to match, or just rely on the `?logbutton` command below instead.
-4. `PermissionLevel.SUPPORTER` — swap for whatever permission tier you want
-   able to run the manual command (e.g. `MODERATOR`).
+THINGS TO DOUBLE-CHECK
+-----------------------
+- `self.bot.api.get_log(channel_id)` — inferred read-method name; if
+  core/clients.py names it differently, update the one line below that
+  calls it.
+- Log message `type` values: this keeps entries typed "thread_message" or
+  "anonymous" (real conversation) and drops "note"/"internal"/system
+  entries, matching the type_ values used elsewhere in this codebase's
+  api.append_log calls.
 """
 
 import discord
 from discord.ext import commands
 
-from core.models import PermissionLevel
-from core import checks
 
+class LogRequestButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"logrequest:(?P<channel_id>[0-9]+)",
+):
+    """A button whose custom_id encodes which thread's log to pull.
+    Reconstructed automatically by discord.py whenever a matching
+    interaction comes in — no need to keep the original View alive."""
 
-class LogRequestView(discord.ui.View):
-    """A persistent button that shows just the plain conversation for
-    the thread it's posted in."""
+    def __init__(self, channel_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Request Message Log",
+                style=discord.ButtonStyle.blurple,
+                emoji="📜",
+                custom_id=f"logrequest:{channel_id}",
+            )
+        )
+        self.channel_id = channel_id
 
-    def __init__(self, bot):
-        super().__init__(timeout=None)  # persistent across restarts
-        self.bot = bot
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["channel_id"]))
 
-    @discord.ui.button(
-        label="Request Message Log",
-        style=discord.ButtonStyle.blurple,
-        emoji="📜",
-        custom_id="modmail:request_message_log",
-    )
-    async def request_log(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
+        bot = interaction.client
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        channel = interaction.channel
-        thread = await self.bot.threads.find(channel=channel)
-        if thread is None:
-            return await interaction.followup.send(
-                "This isn't a Modmail thread channel.", ephemeral=True
-            )
-
-        log_data = await self.bot.api.get_log(channel.id)
+        log_data = await bot.api.get_log(self.channel_id)
         if not log_data:
             return await interaction.followup.send(
-                "No log data found for this thread yet.", ephemeral=True
+                "No log data found for this thread.", ephemeral=True
             )
 
         lines = []
         for entry in log_data.get("messages", []):
-            # Keep only genuine conversation turns. Drop system messages,
-            # internal notes, closes, moves, etc.
+            # Keep only genuine conversation turns; drop system messages,
+            # internal notes, moves/closes, etc.
             if entry.get("type") not in ("thread_message", "anonymous"):
                 continue
 
@@ -90,8 +102,7 @@ class LogRequestView(discord.ui.View):
 
         if not lines:
             return await interaction.followup.send(
-                "No messages have been exchanged in this thread yet.",
-                ephemeral=True,
+                "No messages were exchanged in this thread.", ephemeral=True
             )
 
         full_text = "\n".join(lines)
@@ -104,46 +115,18 @@ class LogRequestView(discord.ui.View):
             embed = discord.Embed(
                 title="Message Log" + (" (cont.)" if i else ""),
                 description=chunk,
-                color=self.bot.main_color,
+                color=bot.main_color,
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class LogButton(commands.Cog):
-    """Posts / re-registers the log-request button for thread channels."""
+    """Registers the dynamic button pattern with the bot so it keeps
+    working across restarts without needing to track individual messages."""
 
     def __init__(self, bot):
         self.bot = bot
-        # Re-register the persistent view on bot restart so old buttons
-        # posted before a reboot still work.
-        self.bot.add_view(LogRequestView(bot))
-
-    @commands.Cog.listener()
-    async def on_thread_ready(self, thread, *args, **kwargs):
-        """Fires once a new Modmail thread channel is fully set up.
-        Adjust the event name here if your fork dispatches a differently
-        named event for thread creation."""
-        try:
-            await thread.channel.send(
-                "Staff can click below to pull just the message content "
-                "from this thread (no notes, no system messages).",
-                view=LogRequestView(self.bot),
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    @checks.has_permissions(PermissionLevel.SUPPORTER)
-    @commands.command(name="logbutton")
-    async def logbutton_cmd(self, ctx):
-        """Manually post the log-request button in the current thread channel,
-        useful for threads that existed before this plugin was installed."""
-        thread = await self.bot.threads.find(channel=ctx.channel)
-        if thread is None:
-            return await ctx.send("This command must be used inside a thread channel.")
-        await ctx.send(
-            "Click below to pull just the conversation from this thread.",
-            view=LogRequestView(self.bot),
-        )
+        self.bot.add_dynamic_items(LogRequestButton)
 
 
 async def setup(bot):
