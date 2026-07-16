@@ -1171,11 +1171,18 @@ class Thread:
         tasks = [self.bot.config.update()]
 
         if self.bot.log_channel is not None and self.channel is not None:
-            # Only create a URL button if we actually have a valid log_url
-            view = None
-            if self.bot.config.get("show_log_url_button") and log_url:
-                view = discord.ui.View()
-                view.add_item(discord.ui.Button(label="Log link", url=log_url, style=discord.ButtonStyle.url))
+            # "Request Message Log" replaces the old external "Log link" URL
+            # button: clicking it shows just the plain conversation directly
+            # in this embed instead of opening the external logviewer.
+            view = discord.ui.View(timeout=None)
+            view.add_item(
+                discord.ui.Button(
+                    label="Request Message Log",
+                    style=discord.ButtonStyle.blurple,
+                    emoji="📜",
+                    custom_id=f"logrequest:{self.channel.id}",
+                )
+            )
             tasks.append(self.bot.log_channel.send(embed=embed, view=view))
 
         # Thread closed message
